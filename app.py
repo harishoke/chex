@@ -10,11 +10,14 @@ import sys
 import threading
 import requests
 import re
+import time
 
 # ==============================================================================
-# Chrome Extension Manager v4.0
+# Chrome Extension Manager v4.1
 # Description: A robust GUI tool to correctly manage Chrome extensions across
 #              multiple profiles by manipulating the Preferences file.
+#              CRITICAL FIX: Installation logic rewritten to not depend on
+#              source Preferences file, fixing the 'FATAL' error.
 #
 # Requirements: pip install ttkbootstrap requests
 #
@@ -23,10 +26,10 @@ import re
 # ==============================================================================
 
 # --- Configuration ---
-CURRENT_VERSION = "4.0"
+CURRENT_VERSION = "4.1"
 # !!! IMPORTANT !!!
 # Replace this URL with the raw content link to your script on GitHub.
-UPDATE_URL = "https://raw.githubusercontent.com/harishoke/chex/refs/heads/main/app.py"
+UPDATE_URL = "https://raw.githubusercontent.com/harishoke/chex/main/app.py"
 
 
 # --- Backend Logic (Core functions remain the same) ---
@@ -105,7 +108,6 @@ def get_extensions_for_profile(profile_path, log_callback):
 # --- GUI Application ---
 
 class Application(tb.Window):
-    # __init__ and create_widgets are mostly the same
     def __init__(self):
         super().__init__(themename="litera")
         self.title(f"Chrome Extension Manager v{CURRENT_VERSION}")
@@ -122,7 +124,6 @@ class Application(tb.Window):
             self.run_task_in_thread(self.check_for_updates)
 
     def log(self, message):
-        """Thread-safely logs a message to the UI."""
         self.after(0, self._update_log_area, message)
 
     def _update_log_area(self, message):
@@ -172,11 +173,9 @@ class Application(tb.Window):
         self.update_button = tb.Button(self.status_bar, text="Update Now", bootstyle="info", command=self.prompt_update)
 
     def load_profiles_async(self):
-        """Loads profile details in the background."""
         self.log("Disclaimer: This is an unofficial tool. Use at your own risk. The developer is not responsible for any data loss or damage.")
-        self.log("Always back up your Chrome profile data before making major changes.")
-        self.log("-" * 50); self.log("Searching for Chrome profiles...")
-        self.all_profiles_map = get_profile_details(self.user_data_path, self.log)
+        self.log("Always back up your Chrome profile data before making major changes."); self.log("-" * 50)
+        self.log("Searching for Chrome profiles..."); self.all_profiles_map = get_profile_details(self.user_data_path, self.log)
         self.after(0, self.populate_profiles_list)
 
     def populate_profiles_list(self):
@@ -191,13 +190,11 @@ class Application(tb.Window):
         selected_profile_name = self.profiles_listbox.get(self.profiles_listbox.curselection()[0])
         selected_profile_path = self.all_profiles_map.get(selected_profile_name)
         if not selected_profile_path: return
-        self.log(f"\nLoading extensions for '{selected_profile_name}'...")
-        self.extensions_listbox.delete(0, END)
+        self.log(f"\nLoading extensions for '{selected_profile_name}'..."); self.extensions_listbox.delete(0, END)
         self.run_task_in_thread(self.load_extensions_async, selected_profile_path)
 
     def load_extensions_async(self, profile_path):
-        self.extensions_map = get_extensions_for_profile(profile_path, self.log)
-        self.after(0, self.populate_extensions_listbox)
+        self.extensions_map = get_extensions_for_profile(profile_path, self.log); self.after(0, self.populate_extensions_listbox)
 
     def populate_extensions_listbox(self):
         if not self.winfo_exists(): return
@@ -207,10 +204,8 @@ class Application(tb.Window):
         self.log(f"Found {len(self.extensions_map)} extensions.")
 
     def run_task_in_thread(self, task_function, *args):
-        self.install_button.config(state=DISABLED)
-        self.uninstall_button.config(state=DISABLED)
-        thread = threading.Thread(target=self.check_and_run, args=(task_function, *args), daemon=True)
-        thread.start()
+        self.install_button.config(state=DISABLED); self.uninstall_button.config(state=DISABLED)
+        thread = threading.Thread(target=self.check_and_run, args=(task_function, *args), daemon=True); thread.start()
 
     def check_and_run(self, task_function, *args):
         task_function(*args)
@@ -218,12 +213,11 @@ class Application(tb.Window):
              self.after(0, self.install_button.config, {'state': NORMAL})
              self.after(0, self.uninstall_button.config, {'state': NORMAL})
 
-    # --- ACTION LOGIC (COMPLETELY REWRITTEN) ---
+    # --- ACTION LOGIC (v4.1 - CRITICAL FIX) ---
 
     def install_selected_extension(self):
         if not self.extensions_listbox.curselection(): messagebox.showwarning("Selection Required", "Please select an extension to install."); return
         display_name = self.extensions_listbox.get(self.extensions_listbox.curselection()[0])
-        source_profile_name = self.profiles_listbox.get(self.profiles_listbox.curselection()[0])
         if messagebox.askyesno("Confirm Install", f"Are you sure you want to install '{display_name}' to all other profiles?"):
             self.run_task_in_thread(self._install_logic, display_name)
 
@@ -232,20 +226,23 @@ class Application(tb.Window):
         ext_id = self.extensions_map[display_name]
         source_profile_name = self.profiles_listbox.get(self.profiles_listbox.curselection()[0])
         source_profile_path = self.all_profiles_map[source_profile_name]
-        
-        # Step 1: Get the master extension entry from the source Preferences file
-        source_prefs_path = os.path.join(source_profile_path, 'Preferences')
-        source_ext_entry = None
+        source_ext_folder = os.path.join(source_profile_path, 'Extensions', ext_id)
+
+        # Step 1: Find and read the manifest.json from the source folder. This is the new source of truth.
+        manifest_data = None
+        manifest_path = None
         try:
-            with open(source_prefs_path, 'r', encoding='utf-8') as f:
-                prefs = json.load(f)
-                source_ext_entry = prefs.get('extensions', {}).get('settings', {}).get(ext_id)
+            version_dirs = [d for d in os.listdir(source_ext_folder) if os.path.isdir(os.path.join(source_ext_folder, d))]
+            latest_version_dir = sorted(version_dirs)[-1]
+            manifest_path = os.path.join(source_ext_folder, latest_version_dir, 'manifest.json')
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                manifest_data = json.load(f)
         except Exception as e:
-            self.log(f"FATAL: Could not read source extension details. Aborting. Error: {e}")
+            self.log(f"FATAL: Could not read manifest.json from source extension. Aborting. Error: {e}")
             return
-            
-        if not source_ext_entry:
-            self.log(f"FATAL: Could not find extension details for '{display_name}' in source profile. Aborting.")
+        
+        if not manifest_data:
+            self.log(f"FATAL: Manifest.json is empty or invalid. Aborting.")
             return
 
         install_count = 0
@@ -254,29 +251,32 @@ class Application(tb.Window):
             self.log(f"-> Processing profile '{profile_name}'...")
 
             # Step 2: Copy the extension folder
-            source_ext_folder = os.path.join(source_profile_path, 'Extensions', ext_id)
             target_ext_folder = os.path.join(profile_path, 'Extensions', ext_id)
-            if os.path.exists(target_ext_folder):
-                self.log("    - Extension folder already exists. Skipping copy.")
+            if os.path.exists(target_ext_folder): self.log("    - Extension folder already exists. Skipping copy.")
             else:
-                try:
-                    shutil.copytree(source_ext_folder, target_ext_folder)
-                    self.log("    - Extension folder copied successfully.")
-                except Exception as e:
-                    self.log(f"    - ERROR copying folder: {e}. Skipping profile.")
-                    continue
+                try: shutil.copytree(source_ext_folder, target_ext_folder); self.log("    - Extension folder copied successfully.")
+                except Exception as e: self.log(f"    - ERROR copying folder: {e}. Skipping profile."); continue
 
-            # Step 3: Add the entry to the target Preferences file
+            # Step 3: Create a new entry and add it to the target Preferences file
             target_prefs_path = os.path.join(profile_path, 'Preferences')
             try:
-                # Backup before modifying
                 shutil.copyfile(target_prefs_path, target_prefs_path + '.bak')
-                
                 with open(target_prefs_path, 'r+', encoding='utf-8') as f:
                     target_prefs = json.load(f)
-                    # Ensure keys exist
-                    target_prefs.setdefault('extensions', {}).setdefault('settings', {})[ext_id] = source_ext_entry
-                    # Go back to the start and write the new content
+                    
+                    # Construct a minimal, valid entry from the manifest data
+                    new_entry = {
+                        "active_permissions": {"api": [], "manifest_permissions": []},
+                        "commands": {},
+                        "install_time": str(int(time.time() * 1000)),
+                        "location": 4, # FROM_WEBSTORE
+                        "manifest": manifest_data,
+                        "path": os.path.join(target_ext_folder, latest_version_dir).replace(profile_path, r"\\?").replace("\\", "/"),
+                        "state": 1, # ENABLED
+                        "was_installed_by_default": False
+                    }
+                    
+                    target_prefs.setdefault('extensions', {}).setdefault('settings', {})[ext_id] = new_entry
                     f.seek(0)
                     json.dump(target_prefs, f, indent=4)
                     f.truncate()
@@ -300,13 +300,9 @@ class Application(tb.Window):
         self.log("\n" + "="*20 + f"\nStarting uninstallation of '{display_name}'...")
         ext_id = self.extensions_map[display_name]
         uninstall_count = 0
-        
         for profile_name, profile_path in self.all_profiles_map.items():
             self.log(f"-> Processing profile '{profile_name}'...")
-            pref_updated = False
-            folder_deleted = False
-
-            # Step 1: Remove the entry from the Preferences file
+            pref_updated, folder_deleted = False, False
             prefs_path = os.path.join(profile_path, 'Preferences')
             if os.path.exists(prefs_path):
                 try:
@@ -315,31 +311,16 @@ class Application(tb.Window):
                         prefs = json.load(f)
                         if ext_id in prefs.get('extensions', {}).get('settings', {}):
                             del prefs['extensions']['settings'][ext_id]
-                            f.seek(0)
-                            json.dump(prefs, f, indent=4)
-                            f.truncate()
-                            self.log("    - Entry removed from Preferences file.")
-                            pref_updated = True
-                        else:
-                            self.log("    - Entry not found in Preferences file.")
-                except Exception as e:
-                    self.log(f"    - ERROR updating Preferences file: {e}")
-
-            # Step 2: Delete the extension folder
+                            f.seek(0); json.dump(prefs, f, indent=4); f.truncate()
+                            self.log("    - Entry removed from Preferences file."); pref_updated = True
+                        else: self.log("    - Entry not found in Preferences file.")
+                except Exception as e: self.log(f"    - ERROR updating Preferences file: {e}")
             extension_folder_path = os.path.join(profile_path, 'Extensions', ext_id)
             if os.path.exists(extension_folder_path):
-                try:
-                    shutil.rmtree(extension_folder_path)
-                    self.log("    - Extension folder deleted.")
-                    folder_deleted = True
-                except Exception as e:
-                    self.log(f"    - ERROR deleting folder: {e}")
-            else:
-                self.log("    - Extension folder not found.")
-            
-            if pref_updated or folder_deleted:
-                uninstall_count += 1
-
+                try: shutil.rmtree(extension_folder_path); self.log("    - Extension folder deleted."); folder_deleted = True
+                except Exception as e: self.log(f"    - ERROR deleting folder: {e}")
+            else: self.log("    - Extension folder not found.")
+            if pref_updated or folder_deleted: uninstall_count += 1
         final_msg = f"Successfully uninstalled '{display_name}' from {uninstall_count} profiles."
         self.log(f"\nFinished! {final_msg}")
         self.after(0, lambda: messagebox.showinfo("Task Complete - Restart Required", f"{final_msg}\n\nPlease fully close and restart Google Chrome for changes to take effect."))
@@ -352,12 +333,14 @@ class Application(tb.Window):
             response = requests.get(UPDATE_URL, timeout=5)
             response.raise_for_status()
             remote_script = response.text
-            match = re.search(r'CURRENT_VERSION\s*=\s*["\'](\d+\.\d+)["\']', remote_script)
+            match = re.search(r'CURRENT_VERSION\s*=\s*["\'](\d+\.\d+(?:\.\d+)?)["\']', remote_script)
             if match:
-                remote_version = match.group(1)
-                if float(remote_version) > float(CURRENT_VERSION):
-                    self.log(f"Update found! New version: {remote_version}")
-                    self.after(0, self.show_update_notification, remote_version)
+                remote_version_str = match.group(1)
+                current_version_tuple = tuple(map(int, (CURRENT_VERSION.split("."))))
+                remote_version_tuple = tuple(map(int, (remote_version_str.split("."))))
+                if remote_version_tuple > current_version_tuple:
+                    self.log(f"Update found! New version: {remote_version_str}")
+                    self.after(0, self.show_update_notification, remote_version_str)
                 else: self.log("You are using the latest version.")
             else: self.log("Could not determine remote version.")
         except Exception as e: self.log(f"Update check failed: {e}")
@@ -381,8 +364,7 @@ class Application(tb.Window):
         os.execl(sys.executable, sys.executable, *sys.argv)
 
 if __name__ == "__main__":
-    try:
-        import ttkbootstrap, requests
+    try: import ttkbootstrap, requests
     except ImportError as e:
         missing_module = str(e).split("'")[-2]
         print(f"Error: Required module '{missing_module}' is not installed.\nPlease install it by running: pip install {missing_module}")
